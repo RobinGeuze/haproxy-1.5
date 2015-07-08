@@ -107,7 +107,7 @@ ARCH =
 
 #### Toolchain options.
 # GCC is normally used both for compiling and linking.
-CC = gcc
+CC = cc
 LD = $(CC)
 
 #### Debug flags (typically "-g").

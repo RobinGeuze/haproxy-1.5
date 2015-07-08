@@ -1024,6 +1024,46 @@ static int ssl_sock_add_cert_sni(SSL_CTX *ctx, struct bind_conf *s, char *name, 
 	return order;
 }
 
+static SSL_CTX* ssl_socket_get_matching_context(struct bind_conf *s, char *name) {
+    struct ebmb_node *node, *n;
+
+    int wild = 0, neg = 0;
+
+    if (*name == '!') {
+        neg = 1;
+        name++;
+    }
+    if (*name == '*') {
+        wild = 1;
+        name++;
+    }
+    /* !* filter is a nop */
+    if (neg && wild)
+        return NULL;
+
+    /* lookup in full qualified names */
+    node = ebst_lookup(&s->sni_ctx, name);
+
+    if (wild) {
+        /* lookup in wildcards names */
+        node = ebst_lookup(&s->sni_w_ctx, name);
+    } else {
+        node = ebst_lookup(&s->sni_ctx, name);
+
+        /* lookup a not neg filter */
+        for (n = node; n; n = ebmb_next_dup(n)) {
+            if (container_of(n, struct sni_ctx, name)->neg == neg) {
+                node = n;
+                break;
+            }
+        }
+    }
+    if (!node || container_of(node, struct sni_ctx, name)->neg != neg)
+        return NULL;
+
+    return container_of(node, struct sni_ctx, name)->ctx;
+}
+
 /* Loads a certificate key and CA chain from a file. Returns 0 on error, -1 if
  * an early error happens and the caller must call SSL_CTX_free() by itelf.
  */
@@ -1031,14 +1071,18 @@ static int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct 
 {
 	BIO *in;
 	X509 *x = NULL, *ca;
-	int i, err;
+	int i,j, err;
 	int ret = -1;
 	int order = 0;
 	X509_NAME *xname;
 	char *str;
+    SSL_CTX **contexts;
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	STACK_OF(GENERAL_NAME) *names;
 #endif
+
+    contexts = malloc(sizeof(SSL_CTX*));
+    contexts[0] = NULL;
 
 	in = BIO_new(BIO_s_file());
 	if (in == NULL)
@@ -1052,8 +1096,33 @@ static int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct 
 		goto end;
 
 	if (fcount) {
-		while (fcount--)
-			order = ssl_sock_add_cert_sni(ctx, s, sni_filter[fcount], order);
+        while (fcount--) {
+            SSL_CTX* sub_ctx = ssl_socket_get_matching_context(s, sni_filter[fcount]);
+            if (sub_ctx == NULL) {
+                order = ssl_sock_add_cert_sni(ctx, s, sni_filter[fcount], order);
+            } else if (sub_ctx != ctx) {
+                SSL_CTX* match_ctx;
+                j = 0;
+                while ((match_ctx = contexts[j]) != NULL) {
+                    if (match_ctx == sub_ctx)
+                        break;
+                    j++;
+                }
+                if (match_ctx == NULL) {
+                    contexts = realloc(contexts, sizeof(SSL_CTX*)*(j + 2));
+                    contexts[j + 1] = NULL;
+                    contexts[j] = sub_ctx;
+
+                    if (SSL_CTX_use_PrivateKey_file(sub_ctx, file, SSL_FILETYPE_PEM) <= 0) {
+                        return 1;
+                    }
+
+                    if (!SSL_CTX_use_certificate(sub_ctx, x))
+                        goto end;
+                }
+            }
+        }
+
 	}
 	else {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
@@ -1063,7 +1132,30 @@ static int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct 
 				GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
 				if (name->type == GEN_DNS) {
 					if (ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.dNSName) >= 0) {
-						order = ssl_sock_add_cert_sni(ctx, s, str, order);
+                        SSL_CTX* sub_ctx = ssl_socket_get_matching_context(s, str);
+                        if (sub_ctx == NULL) {
+                            order = ssl_sock_add_cert_sni(ctx, s, str, order);
+                        } else if (sub_ctx != ctx) {
+                            SSL_CTX* match_ctx;
+                            j = 0;
+                            while ((match_ctx = contexts[j]) != NULL) {
+                                if (match_ctx == sub_ctx)
+                                    break;
+                                j++;
+                            }
+                            if (match_ctx == NULL) {
+                                contexts = realloc(contexts, sizeof(SSL_CTX*)*(j + 2));
+                                contexts[j + 1] = NULL;
+                                contexts[j] = sub_ctx;
+
+                                if (SSL_CTX_use_PrivateKey_file(sub_ctx, file, SSL_FILETYPE_PEM) <= 0) {
+                                    return 1;
+                                }
+
+                                if (!SSL_CTX_use_certificate(sub_ctx, x))
+                                    goto end;
+                            }
+                        }
 						OPENSSL_free(str);
 					}
 				}
@@ -1076,7 +1168,30 @@ static int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct 
 		while ((i = X509_NAME_get_index_by_NID(xname, NID_commonName, i)) != -1) {
 			X509_NAME_ENTRY *entry = X509_NAME_get_entry(xname, i);
 			if (ASN1_STRING_to_UTF8((unsigned char **)&str, entry->value) >= 0) {
-				order = ssl_sock_add_cert_sni(ctx, s, str, order);
+                SSL_CTX* sub_ctx = ssl_socket_get_matching_context(s, str);
+                if (sub_ctx == NULL) {
+                    order = ssl_sock_add_cert_sni(ctx, s, str, order);
+                } else if (sub_ctx != ctx) {
+                    SSL_CTX* match_ctx;
+                    j = 0;
+                    while ((match_ctx = contexts[j]) != NULL) {
+                        if (match_ctx == sub_ctx)
+                            break;
+                        j++;
+                    }
+                    if (match_ctx == NULL) {
+                        contexts = realloc(contexts, sizeof(SSL_CTX*)*(j + 2));
+                        contexts[j + 1] = NULL;
+                        contexts[j] = sub_ctx;
+
+                        if (SSL_CTX_use_PrivateKey_file(sub_ctx, file, SSL_FILETYPE_PEM) <= 0) {
+                            return 1;
+                        }
+
+                        if (!SSL_CTX_use_certificate(sub_ctx, x))
+                            goto end;
+                    }
+                }
 				OPENSSL_free(str);
 			}
 		}
@@ -1114,6 +1229,8 @@ end:
 
 	return ret;
 }
+
+
 
 static int ssl_sock_load_cert_file(const char *path, struct bind_conf *bind_conf, struct proxy *curproxy, char **sni_filter, int fcount, char **err)
 {
