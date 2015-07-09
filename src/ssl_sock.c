@@ -1214,6 +1214,7 @@ static int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct 
                 X509_free(ca);
                 goto end;
             }
+            j++;
         }
 
 		if (!SSL_CTX_add0_chain_cert(ctx, ca)) {
