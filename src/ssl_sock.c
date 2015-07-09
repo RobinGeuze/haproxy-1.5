@@ -1207,7 +1207,16 @@ static int ssl_sock_load_cert_chain_file(SSL_CTX *ctx, const char *file, struct 
 	}
 
 	while ((ca = PEM_read_bio_X509(in, NULL, ctx->default_passwd_callback, ctx->default_passwd_callback_userdata))) {
-		if (!SSL_CTX_add_extra_chain_cert(ctx, ca)) {
+        SSL_CTX* sub_ctx;
+        j = 0;
+        while ((sub_ctx = contexts[j]) != NULL) {
+            if (!SSL_CTX_add0_chain_cert(sub_ctx, ca)) {
+                X509_free(ca);
+                goto end;
+            }
+        }
+
+		if (!SSL_CTX_add0_chain_cert(ctx, ca)) {
 			X509_free(ca);
 			goto end;
 		}
